@@ -14,6 +14,9 @@ regexes = {
     "Google Oauth": re.compile('("client_secret":"[a-zA-Z0-9-_]{24}")'),
     "AWS API Key": re.compile('AKIA[0-9A-Z]{16}'),
     "Heroku API Key": re.compile('[h|H][e|E][r|R][o|O][k|K][u|U].*[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}'),
-    "Generic Secret": re.compile('[s|S][e|E][c|C][r|R][e|E][t|T].*[\'|"][0-9a-zA-Z]{32,45}[\'|"]'),
+    "Generic Secret": re.compile('secret.*[\'|"][0-9a-zA-Z]{2,100}[\'|"]', re.IGNORECASE),
+    "Generic Username": re.compile('username.*[\'|"][0-9a-zA-Z]{2,100}[\'|"]', re.IGNORECASE),
+    "Generic Password": re.compile('password.*[\'|"][0-9a-zA-Z]{2,100}[\'|"]', re.IGNORECASE),
+    # "Generic Secret": re.compile('[s|S][e|E][c|C][r|R][e|E][t|T].*[\'|"][0-9a-zA-Z]{32,45}[\'|"]'),
 }
 

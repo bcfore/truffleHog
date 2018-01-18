@@ -13,22 +13,28 @@ import json
 import stat
 from defaultRegexes.regexChecks import regexes
 from git import Repo
+from urllib.parse import urlparse
 
 def main():
-    parser = argparse.ArgumentParser(description='Find secrets hidden in the depths of git.')
+    parser = argparse.ArgumentParser(description='Find secrets hidden in the depths of git (or just in a local directory).')
     parser.add_argument('--json', dest="output_json", action="store_true", help="Output in JSON")
-    parser.add_argument("--regex", dest="do_regex", action="store_true", help="Enable high signal regex checks")
+    parser.add_argument("--skip_regex", dest="skip_regex", action="store_true", help="Skips the regex checks")
+    parser.add_argument("--skip_entropy", dest="skip_entropy", action="store_true", help="Skips the entropy checks")
     parser.add_argument("--rules", dest="rules", help="Ignore default regexes and source from json list file")
-    parser.add_argument("--entropy", dest="do_entropy", help="Enable entropy checks")
     parser.add_argument("--since_commit", dest="since_commit", help="Only scan from a given commit hash")
     parser.add_argument("--max_depth", dest="max_depth", help="The max commit depth to go back when searching for secrets")
-    parser.add_argument('git_url', type=str, help='URL for secret searching')
-    parser.set_defaults(regex=False)
+    parser.add_argument("--reduce_output", dest="to_reduce_output", action="store_true", help="Do not output the full file text for local searches")
+    # parser.add_argument('git_url', type=str, help='URL for secret searching')
+    parser.add_argument('source_location', type=str, help='Local path or Git URL to search')
+    parser.set_defaults(skip_regex=False)
+    parser.set_defaults(skip_entropy=False)
     parser.set_defaults(rules={})
     parser.set_defaults(max_depth=1000000)
     parser.set_defaults(since_commit=None)
     parser.set_defaults(entropy=True)
+    parser.set_defaults(reduce_output=False)
     args = parser.parse_args()
+
     rules = {}
     if args.rules:
         try:
@@ -42,10 +48,16 @@ def main():
             del regexes[regex]
         for regex in rules:
             regexes[regex] = rules[regex]
-    do_entropy = str2bool(args.do_entropy)
-    output = find_strings(args.git_url, args.since_commit, args.max_depth, args.output_json, args.do_regex, do_entropy)
-    project_path = output["project_path"]
-    shutil.rmtree(project_path, onerror=del_rw)
+
+    url = urlparse(args.source_location)
+    if not url.scheme:
+        output = find_strings_in_dir(args.source_location, not args.skip_regex, not args.skip_entropy, args.to_reduce_output)
+    else:
+        output = find_strings(args.source_location, args.since_commit, args.max_depth, args.output_json, not args.skip_regex, not args.skip_entropy)
+        project_path = output["project_path"]
+        shutil.rmtree(project_path, onerror=del_rw)
+    
+    print_results(args.output_json, output)
 
 def str2bool(v):
     if v == None:
@@ -111,97 +123,147 @@ def clone_git_repo(git_url):
     Repo.clone_from(git_url, project_path)
     return project_path
 
-def print_results(printJson, issue):
-    commit_time = issue['date']
-    branch_name = issue['branch']
-    prev_commit = issue['commit']
-    printableDiff = issue['printDiff']
-    commitHash = issue['commitHash']
-    reason = issue['reason']
-    path = issue['path']
+def print_results(printJson, output):
 
     if printJson:
-        print(json.dumps(issue, sort_keys=True, indent=4))
+        # print(json.dumps(issue, sort_keys=True, indent=4))
+        print(json.dumps(output, indent=4))
     else:
-        print("~~~~~~~~~~~~~~~~~~~~~")
-        reason = "{}Reason: {}{}".format(bcolors.OKGREEN, reason, bcolors.ENDC)
-        print(reason)
-        dateStr = "{}Date: {}{}".format(bcolors.OKGREEN, commit_time, bcolors.ENDC)
-        print(dateStr)
-        hashStr = "{}Hash: {}{}".format(bcolors.OKGREEN, commitHash, bcolors.ENDC)
-        print(hashStr)
-        filePath = "{}Filepath: {}{}".format(bcolors.OKGREEN, path, bcolors.ENDC)
-        print(filePath)
+        for issue in output["foundIssues"]:
+            print("~~~~~~~~~~~~~~~~~~~~~")
+            print_diff = issue.pop('printDiff', None)
+            for key, value in issue.items():
+                key_str = key.capitalize()
+                value_str = value if sys.version_info >= (3, 0) else value.encode('utf-8')
+                print("{}{}: {}{}".format(bcolors.OKGREEN, key_str, value_str, bcolors.ENDC))
+            if print_diff:
+                print(print_diff)
+            print("~~~~~~~~~~~~~~~~~~~~~")
 
-        if sys.version_info >= (3, 0):
-            branchStr = "{}Branch: {}{}".format(bcolors.OKGREEN, branch_name, bcolors.ENDC)
-            print(branchStr)
-            commitStr = "{}Commit: {}{}".format(bcolors.OKGREEN, prev_commit, bcolors.ENDC)
-            print(commitStr)
-            print(printableDiff)
-        else:
-            branchStr = "{}Branch: {}{}".format(bcolors.OKGREEN, branch_name.encode('utf-8'), bcolors.ENDC)
-            print(branchStr)
-            commitStr = "{}Commit: {}{}".format(bcolors.OKGREEN, prev_commit.encode('utf-8'), bcolors.ENDC)
-            print(commitStr)
-            print(printableDiff.encode('utf-8'))
-        print("~~~~~~~~~~~~~~~~~~~~~")
+# def find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash):
+def find_entropy(printableDiff, issue_template, to_reduce_output=False):
+    issue_template['reason'] = "High Entropy"
 
-def find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash):
-    stringsFound = []
+    issue = None
+    strings_found = []
+    marked_lines = []
+
     lines = printableDiff.split("\n")
-    for line in lines:
+    for i, line in enumerate(lines):
         for word in line.split():
             base64_strings = get_strings_of_set(word, BASE64_CHARS)
             hex_strings = get_strings_of_set(word, HEX_CHARS)
             for string in base64_strings:
                 b64Entropy = shannon_entropy(string, BASE64_CHARS)
                 if b64Entropy > 4.5:
-                    stringsFound.append(string)
-                    printableDiff = printableDiff.replace(string, bcolors.WARNING + string + bcolors.ENDC)
+                    strings_found.append(string)
+                    marked_lines.append(label_line(i + 1, line))
+                    if not to_reduce_output:
+                        printableDiff = printableDiff.replace(string, bcolors.WARNING + string + bcolors.ENDC)
             for string in hex_strings:
                 hexEntropy = shannon_entropy(string, HEX_CHARS)
                 if hexEntropy > 3:
-                    stringsFound.append(string)
-                    printableDiff = printableDiff.replace(string, bcolors.WARNING + string + bcolors.ENDC)
-    entropicDiff = None
-    if len(stringsFound) > 0:
-        entropicDiff = {}
-        entropicDiff['date'] = commit_time
-        entropicDiff['path'] = blob.b_path if blob.b_path else blob.a_path
-        entropicDiff['branch'] = branch_name
-        entropicDiff['commit'] = prev_commit.message
-        entropicDiff['diff'] = blob.diff.decode('utf-8', errors='replace')
-        entropicDiff['stringsFound'] = stringsFound
-        entropicDiff['printDiff'] = printableDiff
-        entropicDiff['commitHash'] = commitHash
-        entropicDiff['reason'] = "High Entropy"
-    return entropicDiff
+                    strings_found.append(string)
+                    marked_lines.append(label_line(i + 1, line))
+                    if not to_reduce_output:
+                        printableDiff = printableDiff.replace(string, bcolors.WARNING + string + bcolors.ENDC)
 
-def regex_check(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash):
+    if strings_found:
+        issue = issue_template.copy()
+        issue['the_marked_lines'] = marked_lines
+
+        if not to_reduce_output:
+            issue['strings_found'] = strings_found
+            issue['printDiff'] = printableDiff
+
+    return issue
+
+# def regex_check(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash):
+def regex_check(printableDiff, issue_template, to_reduce_output=False):
     regex_matches = []
+
     for key in regexes:
-        found_strings = regexes[key].findall(printableDiff)
-        for found_string in found_strings:
-            found_diff = printableDiff.replace(printableDiff, bcolors.WARNING + found_string + bcolors.ENDC)
-        if found_strings:
-            foundRegex = {}
-            foundRegex['date'] = commit_time
-            foundRegex['path'] = blob.b_path if blob.b_path else blob.a_path
-            foundRegex['branch'] = branch_name
-            foundRegex['commit'] = prev_commit.message
-            foundRegex['diff'] = blob.diff.decode('utf-8', errors='replace')
-            foundRegex['stringsFound'] = found_strings
-            foundRegex['printDiff'] = found_diff
-            foundRegex['reason'] = key
-            foundRegex['commitHash'] = commitHash
-            regex_matches.append(foundRegex)
+        marked_lines = []
+        strings_found = regexes[key].findall(printableDiff)
+
+        for found_string in strings_found:
+            if not to_reduce_output:
+                found_diff = printableDiff.replace(found_string, bcolors.WARNING + found_string + bcolors.ENDC)
+            marked_lines += get_marked_lines(printableDiff, found_string)
+
+        if strings_found:
+            issue = issue_template.copy()
+            issue['reason'] = key
+            issue['the_marked_lines'] = marked_lines
+
+            if not to_reduce_output:
+                issue['strings_found'] = strings_found
+                issue['printDiff'] = found_diff
+
+            regex_matches.append(issue)
+
     return regex_matches
 
+def get_marked_lines(text, token):
+    marked_lines = []
+
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if token in line:
+            marked_lines.append(label_line(i + 1, line))
+
+    return marked_lines
+
+def label_line(line_number, line):
+    return '{}: {}'.format(line_number, line)
 
 
+def find_strings_in_dir(directory, do_regex, do_entropy, to_reduce_output):
+# From Runako
+    output = {"foundIssues": [], "skippedFiles": []}
 
-def find_strings(git_url, since_commit=None, max_depth=None, printJson=False, do_regex=False, do_entropy=True):
+    for root, subdirs, files in os.walk(directory):
+        files = [f for f in files if not f == '.gitignore']
+        subdirs[:] = [d for d in subdirs if not d[0] == '.']
+        for f in files:
+            full_path = os.path.join(root, f)
+
+            # Chop the directory from the left.
+            display_path = full_path[len(directory) + 1 :]
+
+            # try:
+            try:
+                text = open(full_path, 'r').read()
+            except (UnicodeDecodeError):
+                # print("Skipping " + full_path + " (trouble decoding file)")
+                output["skippedFiles"].append(full_path)
+                continue
+                # text = open(full_path, 'r', -1, 'latin-1').read()
+            # except:
+            #     print("Skipping " + full_path + " (trouble decoding file)")
+            #     continue
+
+            found_issues = find_strings_in_text(text, display_path, do_regex, do_entropy, to_reduce_output)
+            output["foundIssues"] += found_issues
+    
+    return output
+
+def find_strings_in_text(text, title, do_regex, do_entropy, to_reduce_output):
+    issue_template = {"path": title}
+    found_issues = []
+
+    if do_entropy:
+        entropicDiff = find_entropy(text, issue_template.copy(), to_reduce_output)
+        if entropicDiff:
+            found_issues.append(entropicDiff)
+
+    if do_regex:
+        found_regexes = regex_check(text, issue_template.copy(), to_reduce_output)
+        found_issues += found_regexes
+
+    return found_issues
+
+def find_strings(git_url, since_commit, max_depth, printJson, do_regex, do_entropy):
     output = {"foundIssues": []}
     project_path = clone_git_repo(git_url)
     repo = Repo(project_path)
@@ -239,16 +301,27 @@ def find_strings(git_url, since_commit=None, max_depth=None, printJson=False, do
                     if printableDiff.startswith("Binary files"):
                         continue
                     commit_time =  datetime.datetime.fromtimestamp(prev_commit.committed_date).strftime('%Y-%m-%d %H:%M:%S')
+
+                    issue_template = {}
+                    issue_template['date'] = commit_time
+                    issue_template['path'] = blob.b_path if blob.b_path else blob.a_path
+                    issue_template['branch'] = branch_name
+                    issue_template['commit'] = prev_commit.message
+                    issue_template['diff'] = blob.diff.decode('utf-8', errors='replace')
+                    issue_template['commitHash'] = commitHash
+
                     foundIssues = []
                     if do_entropy:
-                        entropicDiff = find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash)
+                        # entropicDiff = find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash)
+                        entropicDiff = find_entropy(printableDiff, issue_template.copy())
                         if entropicDiff:
                             foundIssues.append(entropicDiff)
                     if do_regex:
-                        found_regexes = regex_check(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash)
+                        # found_regexes = regex_check(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash)
+                        found_regexes = regex_check(printableDiff, issue_template.copy())
                         foundIssues += found_regexes
-                    for foundIssue in foundIssues:
-                        print_results(printJson, foundIssue)
+                    # for foundIssue in foundIssues:
+                    #     print_results(printJson, foundIssue)
                     output["foundIssues"] += foundIssues
 
             prev_commit = curr_commit
